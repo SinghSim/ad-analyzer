@@ -1,0 +1,14 @@
+# Secrets
+.secrets/
+*.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Audio/video temp files
+audio_cache/
+calls/
+*.mp3
+*.mp4
