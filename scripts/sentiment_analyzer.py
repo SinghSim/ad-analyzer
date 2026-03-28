@@ -16,10 +16,11 @@ import re
 import urllib.request
 import urllib.error
 
-# Auto-load secrets
+# Load secrets — this script only needs HF token from ~/.cache, no env secrets
 sys.path.insert(0, '/data/.openclaw/workspace/lib')
 try:
-    import secrets  # noqa: F401 — auto-loads all .secrets/*.env on import
+    import secrets
+    secrets.load(keys=[])  # load nothing — uses HF token from ~/.cache/huggingface/token
 except Exception:
     pass
 

@@ -18,6 +18,9 @@ Requirements:
 
 import os
 import sys
+sys.path.insert(0, '/data/.openclaw/workspace/lib')
+import secrets as _secrets  # noqa
+_secrets.require(['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'NOTION_API_KEY', 'GOOGLE_APPLICATION_CREDENTIALS'])
 import json
 import argparse
 import subprocess
@@ -31,9 +34,14 @@ import base64
 
 try:
     import whisper
+    WHISPER_AVAILABLE = True
 except ImportError:
-    print("Error: openai-whisper not installed. Run: pip install openai-whisper")
-    sys.exit(1)
+    try:
+        sys.path.insert(0, '/data/.local/lib/python3.14/site-packages')
+        import whisper
+        WHISPER_AVAILABLE = True
+    except (ImportError, Exception):
+        WHISPER_AVAILABLE = False
 
 try:
     from anthropic import Anthropic
@@ -446,6 +454,8 @@ def detect_voiceover_presence(video_path: str) -> bool:
     """
     try:
         # Use Whisper's detection to see if it finds meaningful speech
+        if not WHISPER_AVAILABLE:
+            return True  # Assume voiceover present if Whisper unavailable
         model = whisper.load_model("base")
         result = model.transcribe(video_path, verbose=False, task="transcribe")
         transcript = result.get("text", "").strip()
@@ -463,7 +473,7 @@ def detect_voiceover_presence(video_path: str) -> bool:
     except:
         return False
 
-def transcribe_audio(video_path: str) -> Tuple[str, str]:
+def transcribe_audio(video_path: str, analysis_modules: Dict = None) -> Tuple[str, str]:
     """
     Smart transcription: checks for subtitles first, then voiceover, then returns N/A.
     
@@ -473,7 +483,10 @@ def transcribe_audio(video_path: str) -> Tuple[str, str]:
     3. "N/A" (music-only or silent videos)
     
     Returns: (transcript, language)
+    If analysis_modules dict is provided, populates Whisper and Google Cloud STT entries.
     """
+    if analysis_modules is None:
+        analysis_modules = {}
     try:
         # Step 1: Check for embedded subtitles
         print("Checking for subtitles...")
@@ -491,14 +504,26 @@ def transcribe_audio(video_path: str) -> Tuple[str, str]:
             return "N/A", "en"
         
         # Step 3: Transcribe the voiceover
-        model = whisper.load_model("base")
-        detect_result = model.transcribe(video_path, verbose=False, task="transcribe")
-        detected_language = detect_result.get("language", "en")
+        if not WHISPER_AVAILABLE:
+            # Skip Whisper detection, go straight to Google STT
+            detected_language = "en"
+            detect_result = {"text": "", "language": "en"}
+            analysis_modules["whisper"] = ("skip", "unavailable")
+        else:
+            model = whisper.load_model("base")
+            detect_result = model.transcribe(video_path, verbose=False, task="transcribe")
+            detected_language = detect_result.get("language", "en")
+            analysis_modules["whisper"] = ("ok", f"language detected: {detected_language}")
         
-        if detected_language == "en":
+        if not WHISPER_AVAILABLE:
+            # No Whisper — use Google STT with auto language detection
+            detected_language = "auto"
+
+        if detected_language == "en" and WHISPER_AVAILABLE:
             # Use Whisper for English
             print("Transcribing audio with Whisper (English)...")
             transcript = detect_result["text"]
+            analysis_modules["google_stt"] = ("skip", "not needed (English + Whisper)")
         else:
             # Use Google Cloud STT for non-English
             print(f"Transcribing audio with Google Cloud STT ({detected_language})...")
@@ -521,22 +546,30 @@ def transcribe_audio(video_path: str) -> Tuple[str, str]:
                     content = audio_file.read()
                 
                 audio = speech.RecognitionAudio(content=content)
+                lang_code = "sv-SE" if detected_language in ("sv", "auto") else detected_language
                 config = speech.RecognitionConfig(
                     encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
                     sample_rate_hertz=16000,
-                    language_code=f"{detected_language}",
+                    language_code=lang_code,
+                    alternative_language_codes=["en-US", "nl-NL", "de-DE", "fr-FR"] if detected_language == "auto" else [],
                     enable_automatic_punctuation=True,
                 )
                 
                 response = client.recognize(config=config, audio=audio)
                 transcript = " ".join([result.alternatives[0].transcript for result in response.results])
+                analysis_modules["google_stt"] = ("ok", f"transcription ({detected_language} → en, {len(transcript)} chars)")
                 
                 # Cleanup
                 os.remove(audio_path)
                 
             except Exception as google_error:
-                print(f"Warning: Google Cloud STT failed ({google_error}). Falling back to Whisper...")
-                transcript = detect_result["text"]
+                analysis_modules["google_stt"] = ("fail", f"failed ({google_error})")
+                if WHISPER_AVAILABLE:
+                    print(f"Warning: Google Cloud STT failed ({google_error}). Falling back to Whisper...")
+                    transcript = detect_result["text"]
+                else:
+                    print(f"Warning: Google Cloud STT failed ({google_error}). Whisper unavailable, using Whisper detect result...")
+                    transcript = detect_result["text"]
         
         print(f"Transcribed {len(transcript)} characters (Language: {detected_language})")
         return transcript.strip(), detected_language
@@ -544,6 +577,8 @@ def transcribe_audio(video_path: str) -> Tuple[str, str]:
     except Exception as e:
         print(f"Warning: Transcription failed: {e}")
         print("Continuing with visual analysis only...")
+        analysis_modules["whisper"] = analysis_modules.get("whisper", ("fail", f"failed ({e})"))
+        analysis_modules["google_stt"] = analysis_modules.get("google_stt", ("fail", f"failed ({e})"))
         return "N/A", "unknown"
 
 # ============================================================================
@@ -1255,6 +1290,7 @@ def upload_to_notion(
     overall_features: Dict,
     all_features: Dict,  # Combined features dict for JSON
     openai_narrative: Dict = None,  # OpenAI storytelling analysis
+    sentiment_result: Dict = None,  # Sentiment analysis results
 ) -> str:
     """
     Upload analysis results to Notion database with full analysis.
@@ -1312,6 +1348,14 @@ def upload_to_notion(
             techniques_str = ", ".join(techniques) if techniques else "N/A"
             properties["Key Techniques"] = {"rich_text": [{"text": {"content": techniques_str[:500]}}]}
         
+        # Add sentiment analysis properties if available
+        if sentiment_result and sentiment_result.get("segments"):
+            properties["Sentiment Overall"] = {"select": {"name": sentiment_result.get("overall_label", "Neutral")}}
+            properties["Sentiment Score"] = {"number": round(sentiment_result.get("overall_score", 0.0), 4)}
+            properties["Hook Sentiment"] = {"rich_text": [{"text": {"content": sentiment_result.get("hook_sentiment", "N/A")}}]}
+            properties["CTA Sentiment"] = {"rich_text": [{"text": {"content": sentiment_result.get("cta_sentiment", "N/A")}}]}
+            properties["Emotional Arc"] = {"rich_text": [{"text": {"content": sentiment_result.get("emotional_arc", "N/A")}}]}
+
         # Add source link if provided
         if source_url:
             properties["Source link"] = {"url": source_url}
@@ -1436,6 +1480,55 @@ def upload_to_notion(
                         "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"• {suggestion}"}}]}
                     })
         
+        # Add sentiment analysis blocks if available
+        if sentiment_result and sentiment_result.get("segments"):
+            blocks_content.append({
+                "type": "heading_2",
+                "heading_2": {"rich_text": [{"type": "text", "text": {"content": "Sentiment Analysis"}}]}
+            })
+            blocks_content.append({
+                "type": "paragraph",
+                "paragraph": {"rich_text": [
+                    {"type": "text", "text": {"content": f"Overall: "}, "annotations": {"bold": True}},
+                    {"type": "text", "text": {"content": f"{sentiment_result['overall_label']} (score: {sentiment_result['overall_score']:.2f})"}}
+                ]}
+            })
+            blocks_content.append({
+                "type": "paragraph",
+                "paragraph": {"rich_text": [
+                    {"type": "text", "text": {"content": f"Hook Sentiment: "}, "annotations": {"bold": True}},
+                    {"type": "text", "text": {"content": sentiment_result.get("hook_sentiment", "N/A")}}
+                ]}
+            })
+            blocks_content.append({
+                "type": "paragraph",
+                "paragraph": {"rich_text": [
+                    {"type": "text", "text": {"content": f"CTA Sentiment: "}, "annotations": {"bold": True}},
+                    {"type": "text", "text": {"content": sentiment_result.get("cta_sentiment", "N/A")}}
+                ]}
+            })
+            blocks_content.append({
+                "type": "paragraph",
+                "paragraph": {"rich_text": [
+                    {"type": "text", "text": {"content": f"Emotional Arc: "}, "annotations": {"bold": True}},
+                    {"type": "text", "text": {"content": sentiment_result.get("emotional_arc", "N/A")}}
+                ]}
+            })
+
+            # Per-segment breakdown
+            if len(sentiment_result["segments"]) > 1:
+                blocks_content.append({
+                    "type": "heading_3",
+                    "heading_3": {"rich_text": [{"type": "text", "text": {"content": "Segment Breakdown"}}]}
+                })
+                for seg in sentiment_result["segments"]:
+                    blocks_content.append({
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": [{"type": "text", "text": {
+                            "content": f"• [{seg['label']} {seg['confidence']:.0%}] {seg['text']}"
+                        }}]}
+                    })
+
         # Write blocks to temp file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(blocks_content, f)
@@ -1472,6 +1565,7 @@ def main():
     parser.add_argument("--language", help="Override detected language (e.g., 'da' for Danish, 'sv' for Swedish)")
     parser.add_argument("--gender", help="Override detected gender (female or male)", choices=["female", "male"])
     parser.add_argument("--skip-openai", action="store_true", help="Skip OpenAI narrative analysis (use Claude only)")
+    parser.add_argument("--sentiment", action="store_true", help="Run sentiment analysis on transcript (uses HuggingFace Inference API)")
     
     args = parser.parse_args()
     
@@ -1479,6 +1573,10 @@ def main():
     print("AD ANALYZER")
     print("=" * 70)
     print()
+    
+    # Track module results: key -> (status, detail)
+    # status: "ok", "skip", "fail"
+    analysis_modules = {}
     
     try:
         # Fetch existing tags from Notion database
@@ -1501,9 +1599,11 @@ def main():
         
         # Extract frames
         frames, duration = extract_frames(args.video, interval_seconds=args.interval)
+        analysis_modules["frame_extraction"] = ("ok", f"{len(frames)} frames @ {args.interval}s intervals")
         
         # Transcribe audio (returns transcript + language)
-        transcript_original, detected_language = transcribe_audio(args.video)
+        # Pass analysis_modules so Whisper/Google STT can populate their entries
+        transcript_original, detected_language = transcribe_audio(args.video, analysis_modules)
         
         # Use provided language override if given, otherwise use detected language
         language = args.language if args.language else detected_language
@@ -1517,13 +1617,43 @@ def main():
         visual = analyze_visual_features(frames, transcript_english, args.gender)
         audio = analyze_audio_features(transcript_english)
         overall = analyze_overall_features(transcript_english)
+        analysis_modules["claude_vision"] = ("ok", "feature detection")
 
         # OpenAI narrative/storytelling analysis (optional, runs if API key set)
         openai_narrative = {}
         if _OPENAI_AVAILABLE and not args.skip_openai:
             openai_narrative = analyze_narrative_with_openai(frames, transcript_english, duration)
+            if openai_narrative:
+                score = openai_narrative.get("storytelling_score", "?")
+                analysis_modules["openai_narrative"] = ("ok", f"storytelling score: {score}/10")
+            else:
+                analysis_modules["openai_narrative"] = ("fail", "no response")
         elif args.skip_openai:
             print("Skipping OpenAI narrative analysis (--skip-openai flag)")
+            analysis_modules["openai_narrative"] = ("skip", "skipped (--skip-openai)")
+        elif not os.environ.get("OPENAI_API_KEY"):
+            analysis_modules["openai_narrative"] = ("skip", "no API key")
+        else:
+            analysis_modules["openai_narrative"] = ("skip", "SDK not installed")
+
+        # Sentiment analysis (optional)
+        sentiment_result = {}
+        if args.sentiment:
+            print()
+            print("Running sentiment analysis on transcript...")
+            try:
+                from sentiment_analyzer import analyze_transcript_sentiment
+                sentiment_result = analyze_transcript_sentiment(transcript_english)
+                print(f"✓ Sentiment analysis complete: {sentiment_result.get('overall_label', '?')} "
+                      f"(score: {sentiment_result.get('overall_score', 0):.2f})")
+                overall_label = sentiment_result.get('overall_label', '?')
+                overall_score = sentiment_result.get('overall_score', 0)
+                analysis_modules["hf_sentiment"] = ("ok", f"overall: {overall_label} ({overall_score:.2f})")
+            except Exception as e:
+                print(f"Warning: Sentiment analysis failed ({e})")
+                analysis_modules["hf_sentiment"] = ("fail", f"failed ({e})")
+        else:
+            analysis_modules["hf_sentiment"] = ("skip", "skipped (no --sentiment flag)")
 
         # Prepare summary
         print()
@@ -1564,6 +1694,15 @@ def main():
             if emo:
                 print(f"  Emotional Arc: {emo[:120]}...")
 
+        # Show sentiment analysis if available
+        if sentiment_result and sentiment_result.get("segments"):
+            print()
+            print("Sentiment Analysis:")
+            print(f"  Overall: {sentiment_result['overall_label']} (score: {sentiment_result['overall_score']:.2f})")
+            print(f"  Hook Sentiment: {sentiment_result['hook_sentiment']}")
+            print(f"  CTA Sentiment: {sentiment_result['cta_sentiment']}")
+            print(f"  Emotional Arc: {sentiment_result['emotional_arc']}")
+
         print()
         print("Transcript (English):")
         print(f"  {transcript_english[:200]}..." if len(transcript_english) > 200 else f"  {transcript_english}")
@@ -1588,10 +1727,31 @@ def main():
             overall,
             all_features,
             openai_narrative=openai_narrative,
+            sentiment_result=sentiment_result,
         )
         
         if notion_url:
             print(f"View in Notion: {notion_url}")
+            analysis_modules["notion_upload"] = ("ok", notion_url)
+        else:
+            analysis_modules["notion_upload"] = ("fail", "no URL returned")
+        
+        # Print Analysis Modules summary
+        print()
+        print("Analysis Modules:")
+        module_display_order = [
+            ("frame_extraction", "Frame Extraction"),
+            ("whisper", "Whisper"),
+            ("google_stt", "Google Cloud STT"),
+            ("claude_vision", "Claude Vision"),
+            ("openai_narrative", "GPT-4o Narrative"),
+            ("hf_sentiment", "HuggingFace Sentiment"),
+            ("notion_upload", "Notion Upload"),
+        ]
+        for key, label in module_display_order:
+            status, detail = analysis_modules.get(key, ("skip", "not configured"))
+            icon = "✓" if status == "ok" else "✗"
+            print(f"  {icon} {label:<24} {detail}")
         
         print()
         print("=" * 70)
